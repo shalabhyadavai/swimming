@@ -1,25 +1,34 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
-from sentence_transformers import SentenceTransformer
-model = SentenceTransformer("all-MiniLM-L6-v2")
+from transformers import AutoTokenizer, AutoModel
+import torch
 from groq import Groq
 import os
 import chromadb
 from chromadb.utils import embedding_functions
 
-# Configure Chroma client
-chroma_client = chromadb.Client()
-chroma_collection = None
-
-# Load model
+# Load model using transformers
 @st.cache_resource
 def load_model():
-    return SentenceTransformer("all-MiniLM-L6-v2")
+    tokenizer = AutoTokenizer.from_pretrained("sentence-transformers/all-MiniLM-L6-v2")
+    model = AutoModel.from_pretrained("sentence-transformers/all-MiniLM-L6-v2")
+    return tokenizer, model
 
-model = load_model()
+tokenizer, model = load_model()
 
-# Sidebar inputs
+def embed(texts):
+    inputs = tokenizer(texts, padding=True, truncation=True, return_tensors="pt")
+    with torch.no_grad():
+        model_output = model(**inputs)
+    embeddings = model_output.last_hidden_state.mean(dim=1)  # mean pooling
+    return embeddings.numpy()
+
+# Streamlit UI
+st.set_page_config(page_title="SwimCoach AI Assistant", layout="wide")
+st.title("🏊 SwimCoach AI Assistant")
+
+# Sidebar
 st.sidebar.header("Athlete Profile")
 age = st.sidebar.number_input("Age", min_value=8, max_value=25, value=14)
 skill = st.sidebar.selectbox("Skill Level", ["Beginner", "Intermediate", "Advanced"])
@@ -28,7 +37,8 @@ goal = st.sidebar.text_input("Training Goal", "Improve breathing rhythm")
 api_key = st.sidebar.text_input("Groq API Key", type="password")
 kb_file = st.sidebar.file_uploader("Upload KB CSV", type=["csv"])
 
-st.title("🏊 SwimCoach AI Assistant")
+# Chroma setup
+chroma_client = chromadb.Client()
 
 if st.button("Get Recommendations"):
     if not api_key:
@@ -37,7 +47,6 @@ if st.button("Get Recommendations"):
         os.environ["GROQ_API_KEY"] = api_key
         client = Groq(api_key=api_key)
 
-        # Load KB
         if kb_file is not None:
             df = pd.read_csv(kb_file)
         else:
@@ -48,15 +57,19 @@ if st.button("Get Recommendations"):
         texts = df["text"].tolist()
         ids = [f"id_{i}" for i in range(len(texts))]
 
-        # Embed and store with Chroma
-        embedding_fn = embedding_functions.SentenceTransformerEmbeddingFunction(model_name="all-MiniLM-L6-v2")
-        chroma_collection = chroma_client.get_or_create_collection(name="swim_kb", embedding_function=embedding_fn)
-        chroma_collection.add(documents=texts, ids=ids)
+        embeddings = embed(texts)
+        collection = chroma_client.get_or_create_collection(name="swim_kb")
 
-        # Query
+        # Clear and re-add to Chroma
+        if len(collection.get(ids=[]).get("ids", [])) > 0:
+            collection.delete(ids=collection.get()["ids"])
+        collection.add(documents=texts, ids=ids, embeddings=embeddings.tolist())
+
+        # Query embedding
         athlete_query = f"{stroke} {skill} swimmer, age {age}, wants to {goal}"
-        results = chroma_collection.query(query_texts=[athlete_query], n_results=3)
-        context = "\n\n".join(results["documents"][0])
+        query_embedding = embed([athlete_query])[0]
+        result = collection.query(query_embeddings=[query_embedding], n_results=3)
+        context = "\n\n".join(result["documents"][0])
 
         # Prompt
         prompt = f"""
@@ -78,7 +91,7 @@ if st.button("Get Recommendations"):
         {context}
         """
 
-        with st.spinner("Analyzing profiles..."):
+        with st.spinner("Generating your coaching insights..."):
             response = client.chat.completions.create(
                 model="llama3-8b-8192",
                 messages=[

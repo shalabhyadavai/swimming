@@ -1,5 +1,6 @@
 streamlit
 pandas
 chromadb
-sentence-transformers==2.2.2
+transformers
+torch
 groq
