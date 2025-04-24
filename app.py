@@ -2,14 +2,12 @@ import streamlit as st
 import pandas as pd
 import os
 from groq import Groq
-import chromadb
-from chromadb.utils import embedding_functions
 
-# Set up Streamlit
+# UI
 st.set_page_config(page_title="SwimCoach AI Assistant", layout="wide")
 st.title("🏊 SwimCoach AI Assistant")
 
-# Sidebar – Athlete Profile Input
+# Sidebar
 with st.sidebar:
     st.header("Athlete Profile")
     age = st.number_input("Age", min_value=8, max_value=25, value=14)
@@ -19,9 +17,7 @@ with st.sidebar:
     api_key = st.text_input("Groq API Key", type="password")
     kb_file = st.file_uploader("Upload KB CSV", type=["csv"])
 
-# Chroma client
-chroma_client = chromadb.Client()
-
+# Submit button
 if st.button("Get Recommendations"):
     if not api_key:
         st.warning("Please enter your Groq API key.")
@@ -31,31 +27,22 @@ if st.button("Get Recommendations"):
     client = Groq(api_key=api_key)
 
     if kb_file is None:
-        st.error("Please upload your swimming_video_kb.csv file.")
+        st.error("Please upload your KB CSV.")
         st.stop()
 
     # Load KB
     df = pd.read_csv(kb_file)
     df["text"] = df["description"] + " " + df["transcript"]
-    texts = df["text"].tolist()
-    ids = [f"id_{i}" for i in range(len(texts))]
 
-    # Use Chroma's default embedding function (OpenAI-compatible)
-    embed_fn = embedding_functions.DefaultEmbeddingFunction()
-    collection = chroma_client.get_or_create_collection(name="swim_kb", embedding_function=embed_fn)
+    # Filter relevant videos using basic keyword match
+    query_keywords = f"{stroke} {skill} {goal}".lower()
+    filtered_df = df[df["text"].str.lower().str.contains(stroke.lower()) | 
+                     df["text"].str.lower().str.contains(skill.lower()) |
+                     df["text"].str.lower().str.contains(goal.lower())]
 
-    # Clear existing entries and re-upload
-    if collection.count() > 0:
-        collection.delete(ids=collection.get()["ids"])
+    top_context = "\n\n".join(filtered_df["text"].head(3).tolist())
 
-    collection.add(documents=texts, ids=ids)
-
-    # Query
-    query = f"{stroke} {skill} swimmer, age {age}, wants to {goal}"
-    results = collection.query(query_texts=[query], n_results=3)
-    context = "\n\n".join(results["documents"][0])
-
-    # LLM Prompt
+    # Prompt
     prompt = f"""
     You are a professional swimming coach assistant.
 
@@ -72,10 +59,10 @@ if st.button("Get Recommendations"):
     3. Expected improvements
 
     Context:
-    {context}
+    {top_context}
     """
 
-    with st.spinner("Generating your personalized coaching plan..."):
+    with st.spinner("Generating your coaching insights..."):
         response = client.chat.completions.create(
             model="llama3-8b-8192",
             messages=[
