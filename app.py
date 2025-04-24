@@ -1,104 +1,89 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
-import faiss # works with faiss-cpu
 from sentence_transformers import SentenceTransformer
 from groq import Groq
 import os
+import chromadb
+from chromadb.utils import embedding_functions
 
-# App title and layout
-st.set_page_config(page_title="SwimCoach AI Assistant", layout="wide")
-st.title("🏊 SwimCoach AI Assistant")
-st.markdown("Get personalized video recommendations for swimmer training using GenAI.")
+# Configure Chroma client
+chroma_client = chromadb.Client()
+chroma_collection = None
 
-# Sidebar – Athlete profile input
-with st.sidebar:
-    st.header("Athlete Profile")
-    age = st.number_input("Age", min_value=8, max_value=25, value=14)
-    skill = st.selectbox("Skill Level", ["Beginner", "Intermediate", "Advanced"])
-    stroke = st.selectbox("Stroke", ["Freestyle", "Butterfly", "Backstroke", "Breaststroke"])
-    goal = st.text_input("Training Goal", "Improve breathing rhythm")
-    api_key = st.text_input("Enter your Groq API Key", type="password")
-
-# File uploader for custom KB
-st.sidebar.markdown("---")
-kb_file = st.sidebar.file_uploader("Upload your KB CSV (Optional)", type=["csv"])
-
-# Load KB and model
-@st.cache_data
-def load_kb(default=True):
-    if default:
-        return pd.read_csv("swimming_video_kb.csv")
-    else:
-        return pd.read_csv(kb_file)
-
+# Load model
 @st.cache_resource
 def load_model():
     return SentenceTransformer("all-MiniLM-L6-v2")
 
-@st.cache_resource
-def build_index(embeddings):
-    dim = embeddings.shape[1]
-    index = faiss.IndexFlatL2(dim)
-    index.add(embeddings)
-    return index
+model = load_model()
 
-# When user clicks the button
-if st.button("Find Recommended Videos"):
+# Sidebar inputs
+st.sidebar.header("Athlete Profile")
+age = st.sidebar.number_input("Age", min_value=8, max_value=25, value=14)
+skill = st.sidebar.selectbox("Skill Level", ["Beginner", "Intermediate", "Advanced"])
+stroke = st.sidebar.selectbox("Stroke", ["Freestyle", "Butterfly", "Backstroke", "Breaststroke"])
+goal = st.sidebar.text_input("Training Goal", "Improve breathing rhythm")
+api_key = st.sidebar.text_input("Groq API Key", type="password")
+kb_file = st.sidebar.file_uploader("Upload KB CSV", type=["csv"])
+
+st.title("🏊 SwimCoach AI Assistant")
+
+if st.button("Get Recommendations"):
     if not api_key:
         st.warning("Please enter your Groq API key.")
     else:
-        try:
-            os.environ["GROQ_API_KEY"] = api_key
-            client = Groq(api_key=api_key)
+        os.environ["GROQ_API_KEY"] = api_key
+        client = Groq(api_key=api_key)
 
-            # Load KB and Model
-            df = load_kb(default=(kb_file is None))
-            model = load_model()
+        # Load KB
+        if kb_file is not None:
+            df = pd.read_csv(kb_file)
+        else:
+            st.error("Please upload a KB CSV file.")
+            st.stop()
 
-            # Create embeddings
-            df["text"] = df["description"] + " " + df["transcript"]
-            df["embedding"] = df["text"].apply(lambda x: model.encode(x).tolist())
-            embeddings = np.array(df["embedding"].tolist()).astype("float32")
+        df["text"] = df["description"] + " " + df["transcript"]
+        texts = df["text"].tolist()
+        ids = [f"id_{i}" for i in range(len(texts))]
 
-            # Build index and query
-            index = build_index(embeddings)
-            query = f"{stroke} {skill} swimmer, age {age}, wants to {goal}"
-            query_vector = model.encode([query]).astype("float32")
-            _, I = index.search(query_vector, k=3)
-            top_entries = df.iloc[I[0]]
-            context = "\n\n".join(top_entries["text"].tolist())
+        # Embed and store with Chroma
+        embedding_fn = embedding_functions.SentenceTransformerEmbeddingFunction(model_name="all-MiniLM-L6-v2")
+        chroma_collection = chroma_client.get_or_create_collection(name="swim_kb", embedding_function=embedding_fn)
+        chroma_collection.add(documents=texts, ids=ids)
 
-            # Prompt for Groq
-            prompt = f"""
-            You are a professional swimming coach assistant.
+        # Query
+        athlete_query = f"{stroke} {skill} swimmer, age {age}, wants to {goal}"
+        results = chroma_collection.query(query_texts=[athlete_query], n_results=3)
+        context = "\n\n".join(results["documents"][0])
 
-            Athlete Profile:
-            - Age: {age}
-            - Skill Level: {skill}
-            - Stroke: {stroke}
-            - Goal: {goal}
+        # Prompt
+        prompt = f"""
+        You are a professional swimming coach assistant.
 
-            Based on the following training video content, suggest 2–3 YouTube videos that are likely to help.
-            For each:
-            1. Title (based on content)
-            2. Why it's relevant
-            3. Expected improvements
+        Athlete Profile:
+        - Age: {age}
+        - Skill Level: {skill}
+        - Stroke: {stroke}
+        - Goal: {goal}
 
-            Context:
-            {context}
-            """
+        Based on the following training video content, suggest 2–3 YouTube videos that are likely to help.
+        For each:
+        1. Title (based on content)
+        2. Why it's relevant
+        3. Expected improvements
 
-            with st.spinner("Thinking like a coach..."):
-                response = client.chat.completions.create(
-                    model="llama3-8b-8192",
-                    messages=[
-                        {"role": "system", "content": "You are a helpful swimming coach assistant."},
-                        {"role": "user", "content": prompt}
-                    ]
-                )
-                st.subheader("🏅 Recommended Videos")
-                st.write(response.choices[0].message.content)
+        Context:
+        {context}
+        """
 
-        except Exception as e:
-            st.error(f"❌ Error: {str(e)}")
+        with st.spinner("Analyzing profiles..."):
+            response = client.chat.completions.create(
+                model="llama3-8b-8192",
+                messages=[
+                    {"role": "system", "content": "You are a helpful swimming coach assistant."},
+                    {"role": "user", "content": prompt}
+                ]
+            )
+            st.subheader("🏅 Recommended Videos")
+            st.write(response.choices[0].message.content)
